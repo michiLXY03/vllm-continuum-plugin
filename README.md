@@ -19,6 +19,14 @@ The plugin targets vLLM `0.25.1`, including local wheel versions such as
 `0.25.1+empty`. It fails fast on another vLLM release because Scheduler is an
 internal API.
 
+## Origin and license
+
+This project is a standalone adaptation of
+[`Hanchenli/vllm-continuum`](https://github.com/Hanchenli/vllm-continuum) for
+vLLM 0.25.1. The integration was rewritten as an installable scheduler plugin
+instead of distributing a modified vLLM source tree. It remains under the
+Apache License 2.0; see `LICENSE`.
+
 ## Offline editable install
 
 The target image must already contain vLLM 0.25.1 and its matching device
