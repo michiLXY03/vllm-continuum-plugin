@@ -53,6 +53,9 @@ loading a model:
 continuum-vllm-check
 ```
 
+This command verifies installation and compatibility; it does not prove that a
+running server selected the plugin.
+
 ## Start vLLM
 
 Use the async scheduler when vLLM async scheduling is enabled:
@@ -61,6 +64,20 @@ Use the async scheduler when vLLM async scheduling is enabled:
 vllm serve MODEL \
   --scheduler-cls continuum_vllm.scheduler.AsyncContinuumScheduler \
   --enable-prefix-caching
+```
+
+The engine process prints the following line when the custom Scheduler has
+actually initialized:
+
+```text
+Continuum scheduler active: class=AsyncContinuumScheduler ttl_policy=PaperTTLPolicy allocate_slots_wrapper=enabled
+```
+
+For an end-to-end TTL check, start once with `VLLM_LOGGING_LEVEL=DEBUG`, send a
+non-final request with `job_id` and `this_func_call`, and check for:
+
+```text
+Continuum pinned job=agent-001 tool=pytest ttl=2.000 source=cold_start
 ```
 
 For a deployment that explicitly disables async scheduling:

@@ -23,7 +23,7 @@ from continuum_vllm.policy import (
 )
 from continuum_vllm.request_queue import ContinuumRequestQueue
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.continuum")
 OutputDecoder = Callable[[Sequence[int]], str]
 AllocateSlots = Callable[..., Any]
 
@@ -56,6 +56,12 @@ class ContinuumSchedulerMixin:
         self._continuum_output_decoder = output_decoder or self._make_output_decoder()
         self._replace_waiting_queues()
         self._install_allocate_slots_wrapper()
+        logger.info(
+            "Continuum scheduler active: class=%s ttl_policy=%s "
+            "allocate_slots_wrapper=enabled",
+            type(self).__name__,
+            type(self._continuum_ttl_policy).__name__,
+        )
 
     def _replace_waiting_queues(self) -> None:
         self.waiting = ContinuumRequestQueue(self.waiting)

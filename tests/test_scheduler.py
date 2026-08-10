@@ -108,6 +108,9 @@ class _AsyncScheduler(_Scheduler):
 
 
 class _Logger:
+    def info(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
     def warning(self, *args: Any, **kwargs: Any) -> None:
         pass
 
