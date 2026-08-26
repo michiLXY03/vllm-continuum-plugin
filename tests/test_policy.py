@@ -5,17 +5,23 @@ import pytest
 
 from continuum_vllm.policy import (
     BashToolCallParser,
-    ConstantReconstructionCostEstimator,
+    ConstantPrefillCostEstimator,
     ContinuumRequestMetadata,
     MemoryfulnessEstimator,
+    OnlineReloadCostEstimator,
     PaperTTLConfig,
     PaperTTLPolicy,
     PinManager,
-    QuadraticReconstructionCostEstimator,
+    QuadraticPrefillCostEstimator,
+    ReconstructionCostModel,
     SlidingWindowMean,
     ToolDurationHistory,
     paper_ttl_policy_from_env,
 )
+
+
+def _prefill_only(seconds: float) -> ReconstructionCostModel:
+    return ReconstructionCostModel(prefill=ConstantPrefillCostEstimator(seconds))
 
 
 @dataclass
@@ -122,7 +128,7 @@ def test_paper_ttl_switches_from_global_to_per_tool_history() -> None:
     config = PaperTTLConfig(history_threshold=2, max_history_samples=10)
     policy = PaperTTLPolicy(
         config=config,
-        reconstruction_cost=ConstantReconstructionCostEstimator(10.0),
+        reconstruction=_prefill_only(10.0),
     )
     for duration in (1.0, 2.0, 4.0):
         policy.tool_history.observe("other", duration)
@@ -143,7 +149,7 @@ def test_paper_ttl_maximizes_empirical_utility_and_prefers_shorter_ties() -> Non
     config = PaperTTLConfig(history_threshold=0, max_history_samples=10)
     policy = PaperTTLPolicy(
         config=config,
-        reconstruction_cost=ConstantReconstructionCostEstimator(10.0),
+        reconstruction=_prefill_only(10.0),
     )
     for duration in (1.0, 2.0, 4.0, 6.0, 12.0):
         policy.tool_history.observe("pytest", duration)
@@ -165,7 +171,7 @@ def test_paper_ttl_returns_zero_when_pinning_has_no_utility() -> None:
     config = PaperTTLConfig(history_threshold=0, max_history_samples=10)
     policy = PaperTTLPolicy(
         config=config,
-        reconstruction_cost=ConstantReconstructionCostEstimator(0.0),
+        reconstruction=_prefill_only(0.0),
     )
     policy.tool_history.observe("pytest", 5.0)
 
@@ -185,7 +191,7 @@ def test_paper_ttl_uses_queue_delay_and_memoryfulness() -> None:
     config = PaperTTLConfig(history_threshold=0, max_history_samples=10)
     policy = PaperTTLPolicy(
         config=config,
-        reconstruction_cost=ConstantReconstructionCostEstimator(0.0),
+        reconstruction=_prefill_only(0.0),
     )
     policy.tool_history.observe("pytest", 5.0)
     metadata = ContinuumRequestMetadata(job_id="job", this_func_call="pytest")
@@ -231,7 +237,7 @@ def test_estimators_and_parser() -> None:
     assert memoryfulness.value == 1.0
     assert memoryfulness.sample_count == 4
 
-    quadratic = QuadraticReconstructionCostEstimator(0.001, 0.1, 1.0)
+    quadratic = QuadraticPrefillCostEstimator(0.001, 0.1, 1.0)
     assert quadratic.estimate_seconds(10) == 2.1
     assert ToolDurationHistory.finish_probability((1.0, 2.0, 4.0), 2.0) == 2 / 3
 
@@ -255,7 +261,7 @@ def test_policy_configuration_reads_quadratic_profile_from_environment() -> None
 
     assert policy.config.history_threshold == 2
     assert policy.config.cold_start_ttl_seconds == 3.5
-    assert policy.reconstruction_cost.estimate_seconds(10) == 2.1
+    assert policy.reconstruction.prefill.estimate_seconds(10) == 2.1
 
 
 def test_policy_configuration_requires_complete_quadratic_profile() -> None:
@@ -266,3 +272,113 @@ def test_policy_configuration_requires_complete_quadratic_profile() -> None:
 def test_policy_configuration_rejects_invalid_numbers() -> None:
     with pytest.raises(ValueError, match="CONTINUUM_HISTORY_THRESHOLD"):
         paper_ttl_policy_from_env({"CONTINUUM_HISTORY_THRESHOLD": "many"})
+
+
+def test_reload_estimator_is_cold_until_the_minimum_sample_count() -> None:
+    estimator = OnlineReloadCostEstimator(max_samples=8, min_samples=4)
+
+    for tokens in (1000, 2000, 3000):
+        estimator.observe(tokens, tokens * 1e-6)
+    assert not estimator.is_warm
+    assert estimator.estimate_seconds(4000) is None
+
+    estimator.observe(4000, 4000e-6)
+    assert estimator.is_warm
+    assert estimator.estimate_seconds(4000) == pytest.approx(4000e-6, rel=1e-6)
+
+
+def test_reload_estimator_fits_a_line_and_forgets_old_samples() -> None:
+    estimator = OnlineReloadCostEstimator(max_samples=3, min_samples=2)
+    for tokens in (1000, 2000, 3000):
+        estimator.observe(tokens, 0.01 + tokens * 2e-6)
+
+    slope, intercept = estimator.fit()
+    assert slope == pytest.approx(2e-6, rel=1e-6)
+    assert intercept == pytest.approx(0.01, abs=1e-9)
+
+    # A bounded window drops the oldest sample rather than growing.
+    estimator.observe(4000, 0.02 + 4000 * 4e-6)
+    assert estimator.sample_count == 3
+    assert estimator.samples()[0][0] == 2000
+
+    estimator.observe(0, 1.0)
+    estimator.observe(1000, -1.0)
+    assert estimator.sample_count == 3
+
+
+def test_reconstruction_model_selects_reload_only_when_a_warm_tier_exists() -> None:
+    model = ReconstructionCostModel(
+        prefill=ConstantPrefillCostEstimator(5.0),
+        reload=OnlineReloadCostEstimator(max_samples=8, min_samples=2),
+    )
+
+    assert model.estimate(1000, tier_available=False) == (5.0, "prefill")
+    assert model.estimate(1000, tier_available=True) == (5.0, "prefill_fallback")
+
+    model.observe_reload(1000, 0.1)
+    model.observe_reload(2000, 0.2)
+    seconds, source = model.estimate(1000, tier_available=True)
+    assert source == "reload"
+    assert seconds == pytest.approx(0.1, rel=1e-6)
+    # No tier still means a full recompute.
+    assert model.estimate(1000, tier_available=False) == (5.0, "prefill")
+
+
+def test_tier_reload_shortens_ttl_relative_to_recompute() -> None:
+    config = PaperTTLConfig(
+        history_threshold=0, max_history_samples=10, reload_min_samples=2
+    )
+    model = ReconstructionCostModel(
+        prefill=ConstantPrefillCostEstimator(10.0),
+        reload=OnlineReloadCostEstimator(max_samples=8, min_samples=2),
+    )
+    policy = PaperTTLPolicy(config=config, reconstruction=model)
+    for duration in (1.0, 2.0, 4.0, 6.0, 12.0):
+        policy.tool_history.observe("pytest", duration)
+    metadata = ContinuumRequestMetadata(job_id="job", this_func_call="pytest")
+
+    recompute = policy.on_request_finished(metadata, None, 10.0, 1000, False)
+    assert recompute is not None
+    assert recompute.reconstruction_source == "prefill"
+    assert recompute.reconstruction_seconds == 10.0
+
+    policy.observe_reload(1000, 0.05)
+    policy.observe_reload(2000, 0.10)
+    tiered = policy.on_request_finished(metadata, None, 20.0, 1000, True)
+    assert tiered is not None
+    assert tiered.reconstruction_source == "reload"
+    assert tiered.reconstruction_seconds == pytest.approx(0.05, rel=1e-6)
+    assert tiered.ttl_seconds < recompute.ttl_seconds
+
+
+def test_policy_configuration_reads_a_prefill_profile_file(tmp_path) -> None:
+    profile = tmp_path / "prefill.json"
+    profile.write_text(
+        '{"prefill_coefficients": '
+        '{"quadratic": 0.001, "linear": 0.1, "constant": 1.0}}',
+        encoding="utf-8",
+    )
+
+    policy = paper_ttl_policy_from_env({"CONTINUUM_PREFILL_PROFILE": str(profile)})
+
+    assert policy.reconstruction.prefill.estimate_seconds(10) == 2.1
+
+
+def test_policy_configuration_rejects_a_malformed_prefill_profile(tmp_path) -> None:
+    profile = tmp_path / "prefill.json"
+    profile.write_text('{"nope": 1}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a continuum prefill profile"):
+        paper_ttl_policy_from_env({"CONTINUUM_PREFILL_PROFILE": str(profile)})
+
+
+def test_policy_configuration_reads_reload_window_from_environment() -> None:
+    policy = paper_ttl_policy_from_env(
+        {
+            "CONTINUUM_RELOAD_MAX_SAMPLES": "64",
+            "CONTINUUM_RELOAD_MIN_SAMPLES": "8",
+        }
+    )
+
+    assert policy.config.reload_max_samples == 64
+    assert policy.reconstruction.reload.min_samples == 8

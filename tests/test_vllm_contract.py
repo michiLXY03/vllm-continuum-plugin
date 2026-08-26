@@ -41,6 +41,7 @@ def test_vllm_0251_scheduler_keeps_required_override_points() -> None:
         "_free_request",
         "_free_blocks",
         "_free_request_blocks",
+        "_update_from_kv_xfer_finished",
         "reset_prefix_cache",
         "shutdown",
     } <= methods.keys()
@@ -75,3 +76,29 @@ def test_vllm_0251_exposes_custom_scheduler_and_request_xargs() -> None:
         source = (root / path).read_text(encoding="utf-8")
         assert "vllm_xargs:" in source
         assert "extra_args=extra_args" in source
+
+
+def test_vllm_0251_keeps_the_async_reload_measurement_window() -> None:
+    """The reload estimator needs a start point, an end point, and a size."""
+    root = _vllm_source_root()
+    scheduler = (root / "vllm/v1/core/sched/scheduler.py").read_text(encoding="utf-8")
+
+    # Start: the connector reports an asynchronous load.
+    assert "self.connector.get_num_new_matched_tokens(" in scheduler
+    assert "if load_kv_async:" in scheduler
+    assert "request.status = RequestStatus.WAITING_FOR_REMOTE_KVS" in scheduler
+    # End: the worker reports the transfer finished.
+    assert "self.finished_recving_kv_req_ids.add(req_id)" in scheduler
+    # Size: how many tokens the tier supplied.
+    assert "num_external_computed_tokens = ext_tokens" in scheduler
+
+
+def test_vllm_0251_connector_returns_tokens_and_async_flag() -> None:
+    methods = _class_methods(
+        "vllm/distributed/kv_transfer/kv_connector/v1/base.py",
+        "KVConnectorBase_V1",
+    )
+    signature = methods["get_num_new_matched_tokens"]
+    names = [argument.arg for argument in signature.args.args]
+
+    assert names[:3] == ["self", "request", "num_computed_tokens"]

@@ -40,6 +40,7 @@ def _assert_scheduler_contract(scheduler_cls: Any, kv_cache_manager_cls: Any) ->
         "_free_request",
         "_free_blocks",
         "_free_request_blocks",
+        "_update_from_kv_xfer_finished",
         "reset_prefix_cache",
         "shutdown",
     }

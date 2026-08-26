@@ -60,16 +60,39 @@ class _KVCacheManager:
         self.freed.append(request)
 
 
+class _Connector:
+    """Minimal KVConnectorBase_V1 surface used by the reload estimator."""
+
+    def __init__(self, results: Any = ()) -> None:
+        self.results = deque(results)
+        self.calls: list[tuple[str, int]] = []
+
+    def get_num_new_matched_tokens(
+        self, request: Any, num_computed_tokens: int
+    ) -> tuple[int, bool]:
+        self.calls.append((request.request_id, num_computed_tokens))
+        if self.results:
+            return self.results.popleft()
+        return 0, False
+
+
 class _Scheduler:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(skip_tokenizer_init=True)
+            model_config=SimpleNamespace(skip_tokenizer_init=True),
+            kv_transfer_config=kwargs.pop("kv_transfer_config", None),
         )
         self.kv_cache_manager = kwargs.pop("kv_cache_manager", _KVCacheManager())
+        self.connector = kwargs.pop("connector", None)
+        self.finished_recving_kv_req_ids: set[str] = set()
         self.requests: dict[str, Any] = {}
         self.waiting = _FCFSRequestQueue()
         self.skipped_waiting = _FCFSRequestQueue()
         self.shutdown_called = False
+
+    def _update_from_kv_xfer_finished(self, kv_connector_output: Any) -> None:
+        for request_id in kv_connector_output.finished_recving or ():
+            self.finished_recving_kv_req_ids.add(request_id)
 
     def add_request(self, request: Any) -> None:
         self.requests[request.request_id] = request
@@ -347,3 +370,145 @@ def test_installation_check_loads_both_scheduler_classes(capsys) -> None:
     output = capsys.readouterr().out
     assert "vLLM: 0.25.1+empty" in output
     assert "AsyncContinuumScheduler" in output
+
+
+def _xfer(*request_ids: str) -> Any:
+    return SimpleNamespace(finished_recving=list(request_ids), finished_sending=[])
+
+
+def _reload_scheduler(clock: _Clock, connector: _Connector) -> Any:
+    return ContinuumScheduler(
+        continuum_clock=clock, connector=connector, continuum_environ={}
+    )
+
+
+def test_reload_mode_is_disabled_without_a_kv_connector() -> None:
+    scheduler = ContinuumScheduler(continuum_clock=_Clock(0.0), continuum_environ={})
+
+    assert scheduler._continuum_reload_mode == "disabled"
+    assert scheduler._continuum_original_get_matched is None
+    assert scheduler._continuum_tier_available is False
+
+
+def test_reload_timer_records_a_sample_across_the_async_load_window() -> None:
+    clock = _Clock(100.0)
+    connector = _Connector([(4096, True)])
+    scheduler = _reload_scheduler(clock, connector)
+    assert scheduler._continuum_reload_mode == "online"
+    assert scheduler._continuum_tier_available is True
+
+    request = _request("request")
+    scheduler.connector.get_num_new_matched_tokens(request, 0)
+    assert scheduler._continuum_reload_pending == {"request": (100.0, 4096)}
+
+    clock.now = 100.25
+    scheduler._update_from_kv_xfer_finished(_xfer("request"))
+
+    assert scheduler._continuum_reload_pending == {}
+    assert scheduler._continuum_pin_stats.reload_samples == 1
+    estimator = scheduler._continuum_ttl_policy.reconstruction.reload
+    assert estimator.samples() == ((4096.0, 0.25),)
+
+
+def test_reload_timer_ignores_synchronous_loads() -> None:
+    clock = _Clock(100.0)
+    connector = _Connector([(4096, False)])
+    scheduler = _reload_scheduler(clock, connector)
+
+    scheduler.connector.get_num_new_matched_tokens(_request("request"), 0)
+    clock.now = 100.25
+    scheduler._update_from_kv_xfer_finished(_xfer("request"))
+
+    assert scheduler._continuum_reload_pending == {}
+    assert scheduler._continuum_pin_stats.reload_samples == 0
+
+
+def test_reload_estimator_falls_back_when_load_async_is_disabled() -> None:
+    connector = _Connector([(4096, True)])
+    scheduler = ContinuumScheduler(
+        continuum_clock=_Clock(0.0),
+        connector=connector,
+        continuum_environ={},
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"load_async": "false"}
+        ),
+    )
+
+    assert scheduler._continuum_reload_mode == "prefill_fallback"
+    # The wrapper is not installed, so the connector keeps its own method.
+    assert scheduler._continuum_original_get_matched is None
+    assert scheduler.connector.get_num_new_matched_tokens.__self__ is connector
+    # A tier still exists, so CacheMissCost knows it is estimating conservatively.
+    assert scheduler._continuum_tier_available is True
+
+
+def test_silent_reload_guard_fires_once_after_enough_decisions() -> None:
+    scheduler = _reload_scheduler(_Clock(0.0), _Connector())
+    telemetry = scheduler._continuum_telemetry
+
+    telemetry.counters.decisions = 63
+    assert telemetry.silent_reload_detected(64) is False
+    telemetry.counters.decisions = 64
+    assert telemetry.silent_reload_detected(64) is True
+    assert telemetry.silent_reload_detected(64) is False
+
+
+def test_silent_reload_guard_stays_quiet_once_samples_arrive() -> None:
+    scheduler = _reload_scheduler(_Clock(0.0), _Connector())
+    telemetry = scheduler._continuum_telemetry
+
+    telemetry.counters.decisions = 200
+    telemetry.counters.reload_samples = 1
+    assert telemetry.silent_reload_detected(64) is False
+
+
+def test_shutdown_restores_the_connector_lookup() -> None:
+    connector = _Connector()
+    original = connector.get_num_new_matched_tokens
+    scheduler = _reload_scheduler(_Clock(0.0), connector)
+    assert connector.get_num_new_matched_tokens is not original
+
+    scheduler.shutdown()
+
+    assert connector.get_num_new_matched_tokens == original
+    assert scheduler._continuum_original_get_matched is None
+
+
+def test_tier_availability_reaches_the_ttl_policy() -> None:
+    seen: list[bool] = []
+
+    class _RecordingPolicy:
+        def on_request_arrival(self, metadata: Any, now: float) -> None:
+            return None
+
+        def on_request_finished(
+            self,
+            metadata: Any,
+            output_text: Any,
+            now: float,
+            num_context_tokens: int = 0,
+            tier_available: bool = False,
+        ) -> Any:
+            seen.append(tier_available)
+            return None
+
+        def observe_queue_delay(self, queue_delay: float) -> None:
+            return None
+
+        def observe_program(self, num_turns: int) -> None:
+            return None
+
+        def observe_reload(self, num_tokens: int, seconds: float) -> None:
+            return None
+
+    scheduler = ContinuumScheduler(
+        continuum_clock=_Clock(0.0),
+        connector=_Connector(),
+        continuum_environ={},
+        continuum_ttl_policy=_RecordingPolicy(),
+    )
+    request = _request("request")
+    scheduler.add_request(request)
+    scheduler._free_request(request)
+
+    assert seen == [True]

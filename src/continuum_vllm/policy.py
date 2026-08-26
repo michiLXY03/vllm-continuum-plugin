@@ -1,5 +1,6 @@
 """Continuum request metadata, pin lifecycle, and paper TTL model."""
 
+import json
 import re
 from bisect import bisect_right
 from collections import defaultdict, deque
@@ -10,7 +11,9 @@ from os import environ as process_environ
 from typing import Any, Literal, Protocol
 
 DEFAULT_TTL_SECONDS = 2.0
+DEFAULT_PREFILL_SECONDS = 2.0
 TTLSource = Literal["cold_start", "global", "tool"]
+ReconstructionSource = Literal["prefill", "reload", "prefill_fallback"]
 
 
 def _optional_text(value: Any) -> str | None:
@@ -79,6 +82,8 @@ class TTLDecision:
     source: TTLSource
     finish_probability: float | None = None
     expected_utility: float | None = None
+    reconstruction_seconds: float = 0.0
+    reconstruction_source: ReconstructionSource = "prefill"
 
     def is_active(self, now: float) -> bool:
         return self.expires_at > now
@@ -202,35 +207,38 @@ class TTLPolicy(Protocol):
         output_text: str | None,
         now: float,
         num_context_tokens: int = 0,
+        tier_available: bool = False,
     ) -> TTLDecision | None: ...
 
     def observe_queue_delay(self, queue_delay: float) -> None: ...
 
     def observe_program(self, num_turns: int) -> None: ...
 
+    def observe_reload(self, num_tokens: int, seconds: float) -> None: ...
 
-class ReconstructionCostEstimator(Protocol):
-    """Estimate Prefill-Reload cost in seconds."""
+
+class PrefillCostEstimator(Protocol):
+    """Estimate the cost of recomputing a prefix from scratch, in seconds."""
 
     def estimate_seconds(self, num_context_tokens: int) -> float: ...
 
 
 @dataclass(frozen=True, slots=True)
-class ConstantReconstructionCostEstimator:
-    """Fallback when no hardware/model profile is configured."""
+class ConstantPrefillCostEstimator:
+    """Fallback when no hardware/model prefill profile is configured."""
 
-    seconds: float = DEFAULT_TTL_SECONDS
+    seconds: float = DEFAULT_PREFILL_SECONDS
 
     def __post_init__(self) -> None:
         if self.seconds < 0:
-            raise ValueError("reconstruction cost must be non-negative")
+            raise ValueError("prefill cost must be non-negative")
 
     def estimate_seconds(self, num_context_tokens: int) -> float:
         return self.seconds
 
 
 @dataclass(frozen=True, slots=True)
-class QuadraticReconstructionCostEstimator:
+class QuadraticPrefillCostEstimator:
     """Evaluate the paper's offline quadratic prefill profile."""
 
     quadratic: float
@@ -241,6 +249,106 @@ class QuadraticReconstructionCostEstimator:
         tokens = max(0, num_context_tokens)
         estimate = self.quadratic * tokens**2 + self.linear * tokens + self.constant
         return max(0.0, estimate)
+
+
+class OnlineReloadCostEstimator:
+    """Fit reload latency against transferred tokens from live observations.
+
+    Reload moves bytes rather than running attention, so a linear model is
+    used. Samples come from the KV connector's asynchronous load window and
+    require no offline profiling run.
+    """
+
+    def __init__(self, max_samples: int = 1024, min_samples: int = 32) -> None:
+        if max_samples < 2:
+            raise ValueError("max_samples must be at least 2")
+        if min_samples < 2:
+            raise ValueError("min_samples must be at least 2")
+        if min_samples > max_samples:
+            raise ValueError("min_samples must not exceed max_samples")
+        self._samples: deque[tuple[float, float]] = deque(maxlen=max_samples)
+        self._min_samples = min_samples
+
+    def observe(self, num_tokens: int, seconds: float) -> None:
+        if num_tokens <= 0 or seconds < 0:
+            return
+        self._samples.append((float(num_tokens), max(0.0, float(seconds))))
+
+    @property
+    def min_samples(self) -> int:
+        return self._min_samples
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._samples)
+
+    @property
+    def is_warm(self) -> bool:
+        return len(self._samples) >= self._min_samples
+
+    def fit(self) -> tuple[float, float] | None:
+        """Return (slope_seconds_per_token, intercept_seconds)."""
+        count = len(self._samples)
+        if count < 2:
+            return None
+        sum_x = sum_y = sum_x2 = sum_xy = 0.0
+        for x, y in self._samples:
+            sum_x += x
+            sum_y += y
+            sum_x2 += x * x
+            sum_xy += x * y
+        denominator = count * sum_x2 - sum_x * sum_x
+        if denominator == 0:
+            return 0.0, sum_y / count
+        slope = (count * sum_xy - sum_x * sum_y) / denominator
+        intercept = (sum_y - slope * sum_x) / count
+        return slope, intercept
+
+    def estimate_seconds(self, num_context_tokens: int) -> float | None:
+        if not self.is_warm:
+            return None
+        fitted = self.fit()
+        if fitted is None:
+            return None
+        slope, intercept = fitted
+        return max(0.0, slope * max(0, num_context_tokens) + intercept)
+
+    def samples(self) -> tuple[tuple[float, float], ...]:
+        return tuple(self._samples)
+
+
+class ReconstructionCostModel:
+    """Choose between recompute and tier reload for CacheMissCost(r).
+
+    The paper's ``Prefill-Reload(r)`` term is the cost of getting a prefix
+    back into device memory. That is a recompute when no KV tier is attached
+    and a transfer when one is, so the two are estimated separately and
+    selected at decision time.
+    """
+
+    def __init__(
+        self,
+        prefill: PrefillCostEstimator | None = None,
+        reload: OnlineReloadCostEstimator | None = None,
+    ) -> None:
+        self.prefill = prefill or ConstantPrefillCostEstimator()
+        self.reload = reload or OnlineReloadCostEstimator()
+
+    def observe_reload(self, num_tokens: int, seconds: float) -> None:
+        self.reload.observe(num_tokens, seconds)
+
+    def estimate(
+        self, num_context_tokens: int, tier_available: bool
+    ) -> tuple[float, ReconstructionSource]:
+        if not tier_available:
+            return self.prefill.estimate_seconds(num_context_tokens), "prefill"
+        reload_seconds = self.reload.estimate_seconds(num_context_tokens)
+        if reload_seconds is None:
+            return (
+                self.prefill.estimate_seconds(num_context_tokens),
+                "prefill_fallback",
+            )
+        return reload_seconds, "reload"
 
 
 class SlidingWindowMean:
@@ -347,6 +455,9 @@ class ToolDurationHistory:
     def tool_samples(self, tool_name: str) -> tuple[float, ...]:
         return tuple(self._by_tool.get(tool_name, ()))
 
+    def tool_names(self) -> tuple[str, ...]:
+        return tuple(self._by_tool)
+
     @staticmethod
     def finish_probability(samples: Sequence[float], ttl_seconds: float) -> float:
         if not samples:
@@ -363,6 +474,8 @@ class PaperTTLConfig:
     cold_start_ttl_seconds: float = DEFAULT_TTL_SECONDS
     max_history_samples: int = 4096
     queue_delay_window_size: int = 100
+    reload_max_samples: int = 1024
+    reload_min_samples: int = 32
 
     def __post_init__(self) -> None:
         if self.history_threshold < 0:
@@ -373,6 +486,10 @@ class PaperTTLConfig:
             raise ValueError("max_history_samples must exceed history_threshold")
         if self.queue_delay_window_size <= 0:
             raise ValueError("queue_delay_window_size must be positive")
+        if self.reload_min_samples < 2:
+            raise ValueError("reload_min_samples must be at least 2")
+        if self.reload_max_samples < self.reload_min_samples:
+            raise ValueError("reload_max_samples must be >= reload_min_samples")
 
 
 class BashToolCallParser:
@@ -394,12 +511,15 @@ class PaperTTLPolicy:
     def __init__(
         self,
         config: PaperTTLConfig | None = None,
-        reconstruction_cost: ReconstructionCostEstimator | None = None,
+        reconstruction: ReconstructionCostModel | None = None,
         parser: BashToolCallParser | None = None,
     ) -> None:
         self.config = config or PaperTTLConfig()
-        self.reconstruction_cost = (
-            reconstruction_cost or ConstantReconstructionCostEstimator()
+        self.reconstruction = reconstruction or ReconstructionCostModel(
+            reload=OnlineReloadCostEstimator(
+                max_samples=self.config.reload_max_samples,
+                min_samples=self.config.reload_min_samples,
+            )
         )
         self.parser = parser or BashToolCallParser()
         self.tool_history = ToolDurationHistory(self.config.max_history_samples)
@@ -428,6 +548,7 @@ class PaperTTLPolicy:
         output_text: str | None,
         now: float,
         num_context_tokens: int = 0,
+        tier_available: bool = False,
     ) -> TTLDecision | None:
         if metadata.job_id is None:
             return None
@@ -443,9 +564,14 @@ class PaperTTLPolicy:
         if tool_name is None:
             return None
 
-        ttl_seconds, source, probability, utility = self._select_ttl(
-            tool_name, num_context_tokens
-        )
+        (
+            ttl_seconds,
+            source,
+            probability,
+            utility,
+            reconstruction_seconds,
+            reconstruction_source,
+        ) = self._select_ttl(tool_name, num_context_tokens, tier_available)
         return TTLDecision(
             expires_at=now + ttl_seconds,
             tool_name=tool_name,
@@ -453,17 +579,26 @@ class PaperTTLPolicy:
             source=source,
             finish_probability=probability,
             expected_utility=utility,
+            reconstruction_seconds=reconstruction_seconds,
+            reconstruction_source=reconstruction_source,
         )
 
     def _select_ttl(
-        self, tool_name: str, num_context_tokens: int
-    ) -> tuple[float, TTLSource, float | None, float | None]:
+        self, tool_name: str, num_context_tokens: int, tier_available: bool
+    ) -> tuple[
+        float, TTLSource, float | None, float | None, float, ReconstructionSource
+    ]:
+        reconstruction_seconds, reconstruction_source = self.reconstruction.estimate(
+            num_context_tokens, tier_available
+        )
         if self.tool_history.global_count <= self.config.history_threshold:
             return (
                 self.config.cold_start_ttl_seconds,
                 "cold_start",
                 None,
                 None,
+                reconstruction_seconds,
+                reconstruction_source,
             )
 
         if self.tool_history.tool_count(tool_name) <= self.config.history_threshold:
@@ -474,13 +609,19 @@ class PaperTTLPolicy:
             samples = self.tool_history.tool_samples(tool_name)
 
         benefit_seconds = (
-            self.queue_delay.value * self.memoryfulness.value
-            + self.reconstruction_cost.estimate_seconds(num_context_tokens)
+            self.queue_delay.value * self.memoryfulness.value + reconstruction_seconds
         )
         ttl_seconds, probability, utility = self._maximize_utility(
             samples, benefit_seconds
         )
-        return ttl_seconds, source, probability, utility
+        return (
+            ttl_seconds,
+            source,
+            probability,
+            utility,
+            reconstruction_seconds,
+            reconstruction_source,
+        )
 
     @staticmethod
     def _maximize_utility(
@@ -509,6 +650,64 @@ class PaperTTLPolicy:
     def observe_program(self, num_turns: int) -> None:
         self.memoryfulness.observe_program(num_turns)
 
+    def observe_reload(self, num_tokens: int, seconds: float) -> None:
+        self.reconstruction.observe_reload(num_tokens, seconds)
+
+
+def prefill_estimator_from_profile(path: str) -> QuadraticPrefillCostEstimator:
+    """Load the coefficients written by `continuum-vllm-profile`."""
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    try:
+        coefficients = document["prefill_coefficients"]
+        return QuadraticPrefillCostEstimator(
+            quadratic=float(coefficients["quadratic"]),
+            linear=float(coefficients["linear"]),
+            constant=float(coefficients["constant"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{path} is not a continuum prefill profile; expected a "
+            "'prefill_coefficients' object with quadratic/linear/constant"
+        ) from exc
+
+
+def prefill_estimator_from_env(
+    values: Mapping[str, str],
+) -> PrefillCostEstimator:
+    """Resolve the offline prefill profile, most specific source first."""
+    profile_path = values.get("CONTINUUM_PREFILL_PROFILE")
+    if profile_path:
+        return prefill_estimator_from_profile(profile_path)
+
+    coefficient_names = (
+        "CONTINUUM_PREFILL_QUADRATIC",
+        "CONTINUUM_PREFILL_LINEAR",
+        "CONTINUUM_PREFILL_CONSTANT",
+    )
+    coefficients = [values.get(name) for name in coefficient_names]
+    if any(value is not None for value in coefficients):
+        if not all(value is not None for value in coefficients):
+            raise ValueError(
+                "quadratic prefill profile requires quadratic, linear, and "
+                "constant coefficients"
+            )
+        return QuadraticPrefillCostEstimator(
+            *(
+                _parse_float(name, value)
+                for name, value in zip(coefficient_names, coefficients, strict=True)
+            )
+        )
+
+    legacy = values.get("CONTINUUM_RECONSTRUCTION_SECONDS")
+    if legacy is not None:
+        return ConstantPrefillCostEstimator(
+            _parse_float("CONTINUUM_RECONSTRUCTION_SECONDS", legacy)
+        )
+    return ConstantPrefillCostEstimator(
+        _env_float(values, "CONTINUUM_PREFILL_SECONDS", DEFAULT_PREFILL_SECONDS)
+    )
+
 
 def paper_ttl_policy_from_env(
     environ: Mapping[str, str] | None = None,
@@ -524,37 +723,17 @@ def paper_ttl_policy_from_env(
         queue_delay_window_size=_env_int(
             values, "CONTINUUM_QUEUE_DELAY_WINDOW_SIZE", 100
         ),
+        reload_max_samples=_env_int(values, "CONTINUUM_RELOAD_MAX_SAMPLES", 1024),
+        reload_min_samples=_env_int(values, "CONTINUUM_RELOAD_MIN_SAMPLES", 32),
     )
-
-    coefficient_names = (
-        "CONTINUUM_PREFILL_QUADRATIC",
-        "CONTINUUM_PREFILL_LINEAR",
-        "CONTINUUM_PREFILL_CONSTANT",
+    reconstruction = ReconstructionCostModel(
+        prefill=prefill_estimator_from_env(values),
+        reload=OnlineReloadCostEstimator(
+            max_samples=config.reload_max_samples,
+            min_samples=config.reload_min_samples,
+        ),
     )
-    coefficients = [values.get(name) for name in coefficient_names]
-    if any(value is not None for value in coefficients):
-        if not all(value is not None for value in coefficients):
-            raise ValueError(
-                "quadratic prefill profile requires quadratic, linear, and "
-                "constant coefficients"
-            )
-        reconstruction_cost: ReconstructionCostEstimator = (
-            QuadraticReconstructionCostEstimator(
-                *(
-                    _parse_float(name, value)
-                    for name, value in zip(coefficient_names, coefficients, strict=True)
-                )
-            )
-        )
-    else:
-        reconstruction_cost = ConstantReconstructionCostEstimator(
-            _env_float(
-                values,
-                "CONTINUUM_RECONSTRUCTION_SECONDS",
-                DEFAULT_TTL_SECONDS,
-            )
-        )
-    return PaperTTLPolicy(config=config, reconstruction_cost=reconstruction_cost)
+    return PaperTTLPolicy(config=config, reconstruction=reconstruction)
 
 
 def _env_int(values: Mapping[str, str], name: str, default: int) -> int:

@@ -14,6 +14,9 @@ compile native code.
   program-level FCFS.
 - Computes TTL using the empirical utility model described in the Continuum
   paper.
+- Estimates the paper's `Prefill-Reload(r)` term from two separate curves: an
+  offline prefill profile for recompute, and an online linear fit for tier
+  reload, selected by whether a KV connector is attached.
 
 The plugin targets vLLM `0.25.1`, including local wheel versions such as
 `0.25.1+empty`. It fails fast on another vLLM release because Scheduler is an
@@ -46,8 +49,8 @@ python -m pip install --no-index --no-deps --no-build-isolation -e .
 
 No dependency download or vLLM build is performed.
 
-Validate the installed vLLM version and both custom Scheduler classes without
-loading a model:
+Validate the installed vLLM version, both custom Scheduler classes, and the
+resolved cost model without loading a model:
 
 ```bash
 continuum-vllm-check
@@ -55,6 +58,17 @@ continuum-vllm-check
 
 This command verifies installation and compatibility; it does not prove that a
 running server selected the plugin.
+
+The package installs three commands:
+
+| Command | Purpose |
+| --- | --- |
+| `continuum-vllm-check` | Verify the install and print the resolved cost model |
+| `continuum-vllm-profile` | Measure the offline prefill curve against a plain server |
+| `continuum-vllm-report` | Explain a runtime stats dump |
+
+See [OPERATIONS.md](OPERATIONS.md) for the full deploy, collect, and read
+workflow, including which parameters matter for each deployment shape.
 
 ## Start vLLM
 
@@ -70,14 +84,19 @@ The engine process prints the following line when the custom Scheduler has
 actually initialized:
 
 ```text
-Continuum scheduler active: class=AsyncContinuumScheduler ttl_policy=PaperTTLPolicy allocate_slots_wrapper=enabled
+Continuum scheduler active: class=AsyncContinuumScheduler ttl_policy=PaperTTLPolicy allocate_slots_wrapper=enabled reload_estimator=online (OffloadingConnector)
 ```
+
+The `reload_estimator` field reports how `CacheMissCost` is being estimated:
+`online` when an asynchronous KV connector is attached and reload latency is
+being measured, `prefill_fallback` when a tier exists but loads synchronously,
+and `disabled` when no connector is configured.
 
 For an end-to-end TTL check, start once with `VLLM_LOGGING_LEVEL=DEBUG`, send a
 non-final request with `job_id` and `this_func_call`, and check for:
 
 ```text
-Continuum pinned job=agent-001 tool=pytest ttl=2.000 source=cold_start
+Continuum pinned job=agent-001 tool=pytest ttl=2.000 ttl_source=cold_start recon=0.0623s recon_source=prefill tokens=1024
 ```
 
 For a deployment that explicitly disables async scheduling:
@@ -123,27 +142,66 @@ If `this_func_call` is omitted, the default parser recognizes one fenced
 `bash` block in the generated text. Explicit metadata is recommended for other
 tool-call formats.
 
-## TTL configuration
+## Configuration
 
-The defaults preserve the public prototype's two-second cold-start behavior.
 Configuration is read once when the Scheduler starts.
 
 | Environment variable | Default | Meaning |
 | --- | ---: | --- |
+| `CONTINUUM_PREFILL_PROFILE` | — | Path to a `continuum-vllm-profile` result; highest priority |
+| `CONTINUUM_PREFILL_QUADRATIC` | — | Manual quadratic coefficient; all three required |
+| `CONTINUUM_PREFILL_LINEAR` | — | Manual linear coefficient |
+| `CONTINUUM_PREFILL_CONSTANT` | — | Manual constant coefficient |
+| `CONTINUUM_PREFILL_SECONDS` | `2.0` | Constant fallback when no profile is given |
+| `CONTINUUM_RECONSTRUCTION_SECONDS` | — | Accepted legacy name for the line above |
+| `CONTINUUM_RELOAD_MIN_SAMPLES` | `32` | Reload samples required before the online fit is used |
+| `CONTINUUM_RELOAD_MAX_SAMPLES` | `1024` | Bound on the reload fitting window |
 | `CONTINUUM_HISTORY_THRESHOLD` | `100` | Samples required before empirical TTL |
 | `CONTINUUM_COLD_START_TTL_SECONDS` | `2.0` | TTL before enough samples exist |
 | `CONTINUUM_MAX_HISTORY_SAMPLES` | `4096` | Global and per-tool history bound |
 | `CONTINUUM_QUEUE_DELAY_WINDOW_SIZE` | `100` | Sliding window used for queue delay T |
-| `CONTINUUM_RECONSTRUCTION_SECONDS` | `2.0` | Constant Prefill-Reload fallback |
+| `CONTINUUM_STATS_INTERVAL_SECONDS` | `60` | Periodic stats log and dump refresh; `0` disables |
+| `CONTINUUM_STATS_DUMP_PATH` | — | Stats dump path; the process id is appended |
 
-For a measured quadratic prefill profile, set all three coefficients. The
-constant fallback is then ignored.
+### The two halves of CacheMissCost
+
+The paper's `Prefill-Reload(r)` is the cost of getting a prefix back into
+device memory. That is a recompute when no KV tier is attached and a transfer
+when one is, so the plugin keeps them apart.
+
+**Prefill** is a hardware and model property, independent of any offload tier.
+Measure it once per `(model, device, parallelism, dtype)` against a server
+started **without** a KV connector and **without** prefix caching:
 
 ```bash
-export CONTINUUM_PREFILL_QUADRATIC=0.000001
-export CONTINUUM_PREFILL_LINEAR=0.0001
-export CONTINUUM_PREFILL_CONSTANT=0.01
+continuum-vllm-profile --model MODEL --max-len 32768 --out prefill.json
+export CONTINUUM_PREFILL_PROFILE=prefill.json
 ```
 
 The estimator evaluates
 `quadratic * context_tokens^2 + linear * context_tokens + constant` in seconds.
+
+**Reload** is a transfer property and needs no offline run. The plugin times
+the KV connector's asynchronous load window and fits a line against the number
+of transferred tokens. It is warm after `CONTINUUM_RELOAD_MIN_SAMPLES` samples
+and falls back to the prefill profile until then.
+
+This only works for connectors that load asynchronously. `OffloadingConnector`,
+`MooncakeStoreConnector`, `MooncakeConnector`, `NixlConnector`, and
+`HF3FSKVConnector` do; `SimpleCPUOffloadConnector` does not, and setting
+`load_async: false` in `kv_connector_extra_config` disables it for any
+connector. The plugin detects both cases at startup, reports
+`reload_estimator=prefill_fallback`, and warns again if a tier that claims to
+load asynchronously produces no samples.
+
+## Reading the collected data
+
+```bash
+continuum-vllm-report /path/to/stats.<pid>.json
+```
+
+The report shows the fitted reload curve, the prefill profile, both costs side
+by side across context lengths, the TTL and CacheMissCost source histograms,
+pin outcomes, and per-tool execution percentiles. The dump is refreshed on the
+`CONTINUUM_STATS_INTERVAL_SECONDS` cadence, so the engine does not need to be
+stopped to read it.

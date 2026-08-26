@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "continuum-vllm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Continuum paper TTL scheduling plugin for vLLM 0.25.1"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -13,6 +13,8 @@ license = { file = "LICENSE" }
 
 [project.scripts]
 continuum-vllm-check = "continuum_vllm.check:main"
+continuum-vllm-profile = "continuum_vllm.profile:main"
+continuum-vllm-report = "continuum_vllm.report:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

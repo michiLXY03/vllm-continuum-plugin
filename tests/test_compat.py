@@ -17,6 +17,7 @@ def test_rejects_other_or_malformed_versions(value: str) -> None:
 class _CompatibleScheduler:
     add_request = schedule = _select_waiting_queue_for_scheduling = lambda self: None
     _free_request = _free_blocks = _free_request_blocks = lambda self: None
+    _update_from_kv_xfer_finished = lambda self: None
     reset_prefix_cache = shutdown = lambda self: None
 
 
@@ -35,6 +36,7 @@ def test_rejects_missing_private_scheduler_method() -> None:
             None
         )
         _free_request = _free_blocks = _free_request_blocks = lambda self: None
+        _update_from_kv_xfer_finished = lambda self: None
         reset_prefix_cache = lambda self: None
 
     with pytest.raises(RuntimeError, match="missing methods: shutdown"):
