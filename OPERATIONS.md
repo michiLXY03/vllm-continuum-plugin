@@ -259,7 +259,8 @@ print([c.__name__ for c in ContinuumScheduler.__mro__])
 Continuum stats: mode=online decisions=400 pins=259 ttl_expired=72 handoff=155
   pressure=32 reload_window=120 reload_total=418 reload_warm=True
   reload_us_per_token=1.101 reload_base_ms=4.00 ttl_src={'tool': 400}
-  recon_src={'reload': 400} queue_delay_s=3.200 eta=0.811
+  recon_src={'reload': 400} stage=tool tool_hist=180 T=3.200s/n=64
+  eta=0.811/progs=52 programs_done=52 programs_abandoned=3
 ```
 
 | 字段 | 含义 |
@@ -272,7 +273,11 @@ Continuum stats: mode=online decisions=400 pins=259 ttl_expired=72 handoff=155
 | `reload_warm` | 样本是否够用（`false` 时退回 prefill 曲线） |
 | `reload_us_per_token` | 拟合出的斜率，每 token 多少微秒 |
 | `recon_src` | CacheMissCost 分别用了哪条曲线 |
-| `eta` | 记忆性系数 η |
+| `stage` | 当前能达到的最高冷启动档位:`cold_start` / `global` / `tool` |
+| `tool_hist` | 全局工具耗时样本数 |
+| `T=<值>/n=<样本数>` | 排队延迟 T 及其样本数,**`n=0` 表示这个值是默认值不是实测** |
+| `eta=<值>/progs=<程序数>` | 记忆性系数 η 及贡献程序数,**`progs=0` 时 η 恒为 1.0** |
+| `programs_done` / `programs_abandoned` | 以 `is_last_step` 正常结束 vs 未正常结束的程序数 |
 
 ### 4.3 完整报告
 
@@ -291,6 +296,13 @@ Continuum stats report
   uptime           1843.0 s
   TTL decisions    400
   pins created     259
+
+Cold start progress
+  TTL stage        tool        (cold_start -> global -> tool)
+  tool history     180 / threshold 100
+  queue delay T    3.200 s   from 64 samples (window 100)
+  memoryfulness    eta = 0.811   from 52 programs, 6 distinct lengths
+  programs         52 completed, 3 abandoned, 11 tool calls in flight
 
 Reload estimator (online, from the KV connector)
   mode             online  [OffloadingConnector]
@@ -320,7 +332,7 @@ Pin outcomes
   pressure               32   12.4%
   final                   0    0.0%
 
-Tool execution history (global 180, threshold 5)
+Tool execution history
   tool                      n        p50        p90        p99
   grep                     60  359.77 ms  593.12 ms  690.72 ms
   ls                       60   51.95 ms   82.91 ms   99.39 ms
@@ -349,6 +361,27 @@ ratio 越大说明外部层吸收得越多，**更短的 TTL 才是对的**。
 | `handed off` 60%+ | 健康 | — |
 
 报告会自动在越界时打印提示行。
+
+### Cold start progress 怎么读
+
+论文里有四个量都带「样本不够时用默认值」的语义,而**默认值和实测值在数值上无法
+区分**。这一段就是用来区分它们的。
+
+| 行 | 冷的表现 | 冷意味着什么 | 怎么变热 |
+| --- | --- | --- | --- |
+| `TTL stage` | `cold_start` | TTL 恒等于 `CONTINUUM_COLD_START_TTL_SECONDS`,完全没在用论文的效用模型 | 全局工具耗时样本数超过阈值 K |
+| `queue delay T` | `from 0 samples` | `OutofOrderCost` 恒为 0,benefit 只剩 CacheMissCost | 需要有 pin 被驱逐、且该程序的下一轮回来被调度 |
+| `memoryfulness` | `0 distinct lengths` | η 恒为 1.0 | 需要**至少两种不同轮数**的程序跑完 |
+| `reload` | `warm False` | CacheMissCost 用 prefill 曲线兜底 | 攒够 `CONTINUUM_RELOAD_MIN_SAMPLES` 个异步加载样本 |
+
+**η 那条特别容易误判**:单个程序内部 k 和 N−k 是完全负相关的,所以
+`-Corr(k, N-k)` 恒等于 +1。**只观测到一种轮数的程序时,η 永远是 1.0**,和初值
+一模一样。报告会在 `distinct lengths < 2` 时显式提示。
+
+**`programs` 那一行**:只有以 `is_last_step=1` 正常结束的程序才知道 N,才会进入 η
+的估计。`abandoned` 计的是失败或客户端放弃的程序,它们对 η 没有任何贡献。如果
+`abandoned` 明显多于 `completed`,基本可以断定客户端没在最后一轮传
+`is_last_step`,此时 η 永远不会脱离默认值。
 
 ### Decision sources 怎么读
 
@@ -396,12 +429,34 @@ asynchronous reload samples. The connector is loading synchronously, ...
 这是兜底探测，能抓住类名不在已知同步名单里、但实际同步加载的 connector。
 处理方式同 6.3。
 
-### 6.5 `continuum-vllm-check` 显示 `ConstantPrefillCostEstimator` 且恒为 2.0
+### 6.5 `eta = 1.000` 一直不动
+
+看报告里 `distinct lengths`:
+
+- `0` → 没有任何程序以 `is_last_step=1` 结束。查客户端最后一轮的 `vllm_xargs`。
+- `1` → 所有程序轮数相同。这种负载下 η 恒为 1.0 是**数学上正确的结果**,不是故障。
+- `≥2` 但 η 仍是 1.000 → 巧合,继续观察。
+
+### 6.6 `queue delay T` 一直是 0 samples
+
+T 只在「pin 被驱逐 → 该程序下一轮回来 → 被调度分配」这条完整路径上才记录一次。
+如果 `Pin outcomes` 里 `ttl expired` 和 `pressure` 都是 0,说明还没有 pin 被驱逐过,
+T 自然没有样本。这在低负载下是正常的。
+
+### 6.7 报告里 `tool calls in flight` 持续增长
+
+正常情况下这个数约等于「当前正在执行工具调用的程序数」。如果它持续单调增长,说明
+大量程序开了工具计时却再也没有下一轮。插件会按
+`CONTINUUM_PENDING_TOOL_MAX_AGE_SECONDS`(默认 3600 秒)把它们淘汰掉,并计入
+`expired_tool_calls`——被淘汰的样本会**丢弃而不是记进工具耗时**,因为那个间隔是
+会话被放弃,不是工具执行。
+
+### 6.8 `continuum-vllm-check` 显示 `ConstantPrefillCostEstimator` 且恒为 2.0
 
 `CONTINUUM_PREFILL_PROFILE` 没生效。查路径是否存在、进程是否能读、JSON 里是否有
 `prefill_coefficients` 对象。
 
-### 6.6 找不到 dump 文件
+### 6.9 找不到 dump 文件
 
 文件名带进程号。用通配符：
 
@@ -430,6 +485,8 @@ ls -la /data/continuum/stats.*.json
 | `CONTINUUM_COLD_START_TTL_SECONDS` | `2.0` | 样本不足时的固定 TTL |
 | `CONTINUUM_MAX_HISTORY_SAMPLES` | `4096` | 全局/单工具耗时历史上限 |
 | `CONTINUUM_QUEUE_DELAY_WINDOW_SIZE` | `100` | 排队延迟 T 的滑动窗口大小 |
+| `CONTINUUM_PENDING_TOOL_MAX_ENTRIES` | `4096` | 同时在计时的工具调用上限,超出淘汰最旧的 |
+| `CONTINUUM_PENDING_TOOL_MAX_AGE_SECONDS` | `3600` | 工具计时的最长存活时间,超时丢弃而不记录 |
 | `CONTINUUM_STATS_INTERVAL_SECONDS` | `60` | 周期日志 + dump 刷新间隔，`0` 关闭 |
 | `CONTINUUM_STATS_DUMP_PATH` | — | dump 路径，会自动追加 `.<pid>` |
 

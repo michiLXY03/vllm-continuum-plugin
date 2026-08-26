@@ -18,7 +18,7 @@ from continuum_vllm.policy import (
     TTLDecision,
 )
 
-SCHEMA = "continuum-telemetry/1"
+SCHEMA = "continuum-telemetry/2"
 DEFAULT_ESTIMATE_POINTS = (1000, 4000, 16000, 32000, 65536)
 ReleaseReason = str
 
@@ -159,8 +159,14 @@ class ContinuumTelemetry:
             f"reload_warm={estimator.is_warm} {curve} "
             f"ttl_src={dict(self.ttl_sources)} "
             f"recon_src={dict(self.reconstruction_sources)} "
-            f"queue_delay_s={self.policy.queue_delay.value:.3f} "
-            f"eta={self.policy.memoryfulness.value:.3f}"
+            f"stage={self.policy.ttl_stage} "
+            f"tool_hist={self.policy.tool_history.global_count} "
+            f"T={self.policy.queue_delay.value:.3f}s/n="
+            f"{self.policy.queue_delay.sample_count} "
+            f"eta={self.policy.memoryfulness.value:.3f}/progs="
+            f"{self.policy.memoryfulness.program_count} "
+            f"programs_done={self.policy.completed_programs} "
+            f"programs_abandoned={self.policy.abandoned_programs}"
         )
 
     def _prefill_section(self) -> dict[str, Any]:
@@ -202,6 +208,41 @@ class ContinuumTelemetry:
         section["samples"] = [[int(x), y] for x, y in estimator.samples()]
         return section
 
+    def _cold_start_section(self) -> dict[str, Any]:
+        """Report which inputs are still running on their cold-start default.
+
+        Every one of these has a fallback value that is indistinguishable from
+        a measured one, so the sample counts are what tell an operator whether
+        the model is actually being driven by data yet.
+        """
+        policy = self.policy
+        queue_delay = policy.queue_delay
+        memoryfulness = policy.memoryfulness
+        pending = policy.pending_tools
+        return {
+            "ttl_stage": policy.ttl_stage,
+            "queue_delay": {
+                "value_seconds": queue_delay.value,
+                "samples": queue_delay.sample_count,
+                "window_size": queue_delay.window_size,
+                "is_warm": queue_delay.is_warm,
+            },
+            "memoryfulness": {
+                "value": memoryfulness.value,
+                "programs": memoryfulness.program_count,
+                "distinct_program_lengths": memoryfulness.distinct_length_count,
+                "pair_samples": memoryfulness.sample_count,
+                "is_informative": memoryfulness.is_informative,
+            },
+            "programs": {
+                "completed": policy.completed_programs,
+                "abandoned": policy.abandoned_programs,
+                "pending_tool_calls": len(pending),
+                "expired_tool_calls": pending.expired,
+                "evicted_tool_calls": pending.evicted,
+            },
+        }
+
     def _tool_section(self) -> dict[str, Any]:
         history = self.policy.tool_history
         tools: dict[str, Any] = {}
@@ -237,8 +278,7 @@ class ContinuumTelemetry:
             return document
         document.update(
             {
-                "queue_delay_seconds": self.policy.queue_delay.value,
-                "memoryfulness": self.policy.memoryfulness.value,
+                "cold_start": self._cold_start_section(),
                 "prefill": self._prefill_section(),
                 "reload": self._reload_section(),
                 "tools": self._tool_section(),

@@ -153,3 +153,52 @@ def test_prefill_estimator_stays_constant_without_a_profile() -> None:
 
     assert estimator.estimate_seconds(1000) == 2.0
     assert estimator.estimate_seconds(64000) == 2.0
+
+
+def test_snapshot_reports_cold_start_progress(tmp_path) -> None:
+    telemetry = _telemetry(tmp_path, warm=True)
+
+    cold = telemetry.snapshot()["cold_start"]
+
+    assert cold["ttl_stage"] == "tool"
+    assert cold["queue_delay"]["samples"] == 0
+    assert cold["queue_delay"]["is_warm"] is False
+    assert cold["memoryfulness"]["programs"] == 0
+    assert cold["memoryfulness"]["is_informative"] is False
+    assert cold["programs"]["pending_tool_calls"] == 1
+
+
+def test_report_names_every_input_still_on_its_default(tmp_path, capsys) -> None:
+    telemetry = _telemetry(tmp_path, warm=True)
+    written = telemetry.dump()
+    assert written is not None
+
+    assert report_main([written]) == 0
+
+    output = capsys.readouterr().out
+    assert "Cold start progress" in output
+    assert "T has no samples" in output
+    assert "eta is still its default 1.0" in output
+
+
+def test_report_flags_programs_that_never_send_is_last_step(tmp_path) -> None:
+    telemetry = _telemetry(tmp_path, warm=True)
+    policy = telemetry.policy
+    policy.observe_queue_delay(1.0)
+    policy.observe_program(3)
+    policy.observe_program(7)
+    for index in range(5):
+        policy.on_program_finished(f"job{index}", completed=False)
+    policy.on_program_finished("done", completed=True)
+
+    cold = telemetry.snapshot()["cold_start"]
+
+    assert cold["queue_delay"]["is_warm"] is True
+    assert cold["memoryfulness"]["is_informative"] is True
+    assert cold["programs"] == {
+        "completed": 1,
+        "abandoned": 5,
+        "pending_tool_calls": 1,
+        "expired_tool_calls": 0,
+        "evicted_tool_calls": 0,
+    }

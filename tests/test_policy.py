@@ -11,6 +11,7 @@ from continuum_vllm.policy import (
     OnlineReloadCostEstimator,
     PaperTTLConfig,
     PaperTTLPolicy,
+    PendingToolCalls,
     PinManager,
     QuadraticPrefillCostEstimator,
     ReconstructionCostModel,
@@ -382,3 +383,143 @@ def test_policy_configuration_reads_reload_window_from_environment() -> None:
 
     assert policy.config.reload_max_samples == 64
     assert policy.reconstruction.reload.min_samples == 8
+
+
+def test_pending_tool_calls_expire_instead_of_recording_a_fake_duration() -> None:
+    pending = PendingToolCalls(max_entries=8, max_age_seconds=60.0)
+    pending.start("job", 100.0, "pytest")
+
+    assert pending.finish("job", 100.0 + 61.0) is None
+    assert pending.expired == 1
+    assert len(pending) == 0
+
+
+def test_pending_tool_calls_record_a_duration_inside_the_window() -> None:
+    pending = PendingToolCalls(max_entries=8, max_age_seconds=60.0)
+    pending.start("job", 100.0, "pytest")
+
+    assert pending.finish("job", 103.5) == (3.5, "pytest")
+    assert pending.expired == 0
+    assert pending.finish("job", 104.0) is None
+
+
+def test_pending_tool_calls_are_bounded_and_pruned() -> None:
+    pending = PendingToolCalls(max_entries=2, max_age_seconds=60.0)
+    pending.start("a", 100.0, "x")
+    pending.start("b", 100.0, "y")
+    pending.start("c", 100.0, "z")
+
+    assert len(pending) == 2
+    assert pending.evicted == 1
+    assert "a" not in pending
+
+    # Starting a new call also ages out anything past the window.
+    pending.start("d", 200.0, "w")
+    assert pending.expired == 2
+    assert "d" in pending
+    assert "b" not in pending
+    assert len(pending) == 1
+
+
+def test_abandoned_program_does_not_leak_a_pending_tool_call() -> None:
+    policy = PaperTTLPolicy()
+    metadata = ContinuumRequestMetadata(job_id="job", this_func_call="pytest")
+    policy.on_request_finished(metadata, None, 10.0)
+    assert len(policy.pending_tools) == 1
+
+    policy.on_program_finished("job", completed=False)
+
+    assert len(policy.pending_tools) == 0
+    assert policy.abandoned_programs == 1
+    assert policy.completed_programs == 0
+
+
+def test_completed_program_is_counted_separately() -> None:
+    policy = PaperTTLPolicy()
+
+    policy.on_program_finished("job", completed=True)
+
+    assert policy.completed_programs == 1
+    assert policy.abandoned_programs == 0
+
+
+def test_stale_program_does_not_pollute_the_tool_history() -> None:
+    config = PaperTTLConfig(pending_tool_max_age_seconds=60.0)
+    policy = PaperTTLPolicy(config=config)
+    policy.on_request_finished(
+        ContinuumRequestMetadata(job_id="job", this_func_call="pytest"), None, 10.0
+    )
+
+    # The next turn arrives an hour later; that gap is an abandoned session,
+    # not a tool execution.
+    policy.on_request_arrival(
+        ContinuumRequestMetadata(job_id="job", last_func_call="pytest"), 10.0 + 3600.0
+    )
+
+    assert policy.tool_history.tool_samples("pytest") == ()
+    assert policy.pending_tools.expired == 1
+
+
+def test_ttl_stage_walks_the_three_cold_start_tiers() -> None:
+    config = PaperTTLConfig(history_threshold=2, max_history_samples=10)
+    policy = PaperTTLPolicy(config=config)
+    assert policy.ttl_stage == "cold_start"
+
+    # Enough global samples, but spread thin so no single tool has graduated.
+    for name in ("a", "b", "c"):
+        policy.tool_history.observe(name, 1.0)
+    assert policy.tool_history.global_count == 3
+    assert policy.ttl_stage == "global"
+
+    # Once one tool passes the threshold, the per-tool tier is reachable.
+    for duration in (1.0, 2.0, 4.0):
+        policy.tool_history.observe("pytest", duration)
+    assert policy.ttl_stage == "tool"
+
+
+def test_queue_delay_reports_whether_it_has_any_samples() -> None:
+    window = SlidingWindowMean(window_size=4)
+
+    assert window.is_warm is False
+    assert window.value == 0.0
+    assert window.sample_count == 0
+    assert window.window_size == 4
+
+    window.observe(2.0)
+    assert window.is_warm is True
+    assert window.sample_count == 1
+
+
+def test_memoryfulness_is_uninformative_until_lengths_differ() -> None:
+    memoryfulness = MemoryfulnessEstimator()
+
+    memoryfulness.observe_program(4)
+    # Within one program k and N-k are perfectly anti-correlated.
+    assert memoryfulness.value == 1.0
+    assert memoryfulness.program_count == 1
+    assert memoryfulness.distinct_length_count == 1
+    assert memoryfulness.is_informative is False
+
+    memoryfulness.observe_program(4)
+    assert memoryfulness.is_informative is False
+
+    memoryfulness.observe_program(9)
+    assert memoryfulness.distinct_length_count == 2
+    assert memoryfulness.is_informative is True
+
+
+def test_inline_and_public_finish_probability_agree() -> None:
+    samples = (0.5, 1.0, 1.0, 2.5, 4.0, 9.0)
+    config = PaperTTLConfig(history_threshold=0, max_history_samples=10)
+    policy = PaperTTLPolicy(config=config, reconstruction=_prefill_only(10.0))
+    for duration in samples:
+        policy.tool_history.observe("pytest", duration)
+
+    decision = policy.on_request_finished(
+        ContinuumRequestMetadata(job_id="job", this_func_call="pytest"), None, 10.0
+    )
+
+    assert decision is not None
+    assert decision.finish_probability == ToolDurationHistory.finish_probability(
+        samples, decision.ttl_seconds
+    )

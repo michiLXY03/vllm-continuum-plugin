@@ -42,6 +42,76 @@ def _print_header(document: dict[str, Any]) -> None:
     print(f"  pins created     {counters.get('pins', 0)}")
 
 
+def _print_cold_start(document: dict[str, Any]) -> None:
+    """Show which model inputs are still running on their default value."""
+    cold = document.get("cold_start")
+    if not cold:
+        return
+    queue = cold.get("queue_delay", {})
+    memory = cold.get("memoryfulness", {})
+    programs = cold.get("programs", {})
+    tools = document.get("tools", {})
+
+    print()
+    print("Cold start progress")
+    print(
+        f"  TTL stage        {cold.get('ttl_stage', '?')}"
+        "        (cold_start -> global -> tool)"
+    )
+    print(
+        f"  tool history     {tools.get('global_count', 0)}"
+        f" / threshold {tools.get('threshold', 0)}"
+    )
+    print(
+        f"  queue delay T    {_seconds(queue.get('value_seconds'))}"
+        f"   from {queue.get('samples', 0)} samples"
+        f" (window {queue.get('window_size', 0)})"
+    )
+    print(
+        f"  memoryfulness    eta = {memory.get('value', 0.0):.3f}"
+        f"   from {memory.get('programs', 0)} programs,"
+        f" {memory.get('distinct_program_lengths', 0)} distinct lengths"
+    )
+    print(
+        f"  programs         {programs.get('completed', 0)} completed,"
+        f" {programs.get('abandoned', 0)} abandoned,"
+        f" {programs.get('pending_tool_calls', 0)} tool calls in flight"
+    )
+
+    if cold.get("ttl_stage") == "cold_start":
+        print(
+            "  -> TTL is still the fixed cold-start value. It stays there until\n"
+            "     the global tool history passes the threshold."
+        )
+    if not queue.get("is_warm", False):
+        print(
+            "  -> T has no samples, so OutOfOrderCost contributes nothing yet.\n"
+            "     T is only recorded when an evicted program's next turn is\n"
+            "     admitted, so it stays empty until pins start being dropped."
+        )
+    if not memory.get("is_informative", False):
+        print(
+            "  -> eta is still its default 1.0. Within one program k and N-k are\n"
+            "     perfectly anti-correlated, so eta only carries signal once\n"
+            "     programs of at least two different turn counts have finished."
+        )
+    abandoned = programs.get("abandoned", 0)
+    completed = programs.get("completed", 0)
+    if abandoned and abandoned > completed:
+        print(
+            f"  -> {abandoned} programs ended without is_last_step against"
+            f" {completed} that did.\n"
+            "     Those never reach the eta estimator. Check that the client\n"
+            "     sets is_last_step=1 on the final turn."
+        )
+    expired = programs.get("expired_tool_calls", 0)
+    if expired:
+        print(
+            f"  -> {expired} tool-call timers aged out before the next turn\n"
+            "     arrived and were discarded rather than recorded as durations."
+        )
+
+
 def _print_reload(document: dict[str, Any]) -> dict[str, Any]:
     reload_section = document.get("reload", {})
     mode = reload_section.get("mode", "unknown")
@@ -159,10 +229,7 @@ def _print_tools(document: dict[str, Any]) -> None:
     tools = document.get("tools", {})
     by_tool = tools.get("by_tool", {})
     print()
-    print(
-        f"Tool execution history (global {tools.get('global_count', 0)}, "
-        f"threshold {tools.get('threshold', 0)})"
-    )
+    print("Tool execution history")
     if not by_tool:
         print("  none recorded")
         return
@@ -199,6 +266,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     _print_header(document)
+    _print_cold_start(document)
     reload_section = _print_reload(document)
     _print_comparison(document, reload_section)
     _print_sources(document)

@@ -160,6 +160,8 @@ Configuration is read once when the Scheduler starts.
 | `CONTINUUM_COLD_START_TTL_SECONDS` | `2.0` | TTL before enough samples exist |
 | `CONTINUUM_MAX_HISTORY_SAMPLES` | `4096` | Global and per-tool history bound |
 | `CONTINUUM_QUEUE_DELAY_WINDOW_SIZE` | `100` | Sliding window used for queue delay T |
+| `CONTINUUM_PENDING_TOOL_MAX_ENTRIES` | `4096` | Bound on concurrently timed tool calls |
+| `CONTINUUM_PENDING_TOOL_MAX_AGE_SECONDS` | `3600` | Tool-call timers older than this are dropped, not recorded |
 | `CONTINUUM_STATS_INTERVAL_SECONDS` | `60` | Periodic stats log and dump refresh; `0` disables |
 | `CONTINUUM_STATS_DUMP_PATH` | — | Stats dump path; the process id is appended |
 
@@ -200,8 +202,16 @@ load asynchronously produces no samples.
 continuum-vllm-report /path/to/stats.<pid>.json
 ```
 
-The report shows the fitted reload curve, the prefill profile, both costs side
-by side across context lengths, the TTL and CacheMissCost source histograms,
-pin outcomes, and per-tool execution percentiles. The dump is refreshed on the
+The report shows cold-start progress, the fitted reload curve, the prefill
+profile, both costs side by side across context lengths, the TTL and
+CacheMissCost source histograms, pin outcomes, and per-tool execution
+percentiles.
+
+Every cold-start input has a fallback that is numerically indistinguishable
+from a measured value, so the report prints sample counts next to each one:
+the TTL stage, the queue delay T, the memoryfulness eta, and the reload fit.
+Note that eta stays at exactly 1.0 until programs of at least two different
+turn counts have finished, because within one program k and N-k are perfectly
+anti-correlated. The dump is refreshed on the
 `CONTINUUM_STATS_INTERVAL_SECONDS` cadence, so the engine does not need to be
 stopped to read it.

@@ -284,6 +284,10 @@ class ContinuumSchedulerMixin:
                 previous = self._continuum_pins.pop(metadata.job_id)
                 if previous is not None:
                     self._release_continuum_pin(previous, "final")
+                self._continuum_ttl_policy.on_program_finished(
+                    metadata.job_id,
+                    completed=successful and metadata.is_last_step is True,
+                )
                 self._forget_continuum_program(metadata.job_id)
             else:
                 self._forget_continuum_request(request.request_id)
@@ -362,33 +366,40 @@ class ContinuumSchedulerMixin:
             self._release_continuum_pin(pin, "ttl")
 
     def _on_request_allocated(self, request: Request) -> None:
-        metadata = ContinuumRequestMetadata.from_request(request)
-        waiting_started = self._continuum_evicted_waiting.pop(request.request_id, None)
+        # Runs on every successful allocation, which includes every decode
+        # step of every running request, so the job id is looked up rather
+        # than re-parsed out of sampling_params.extra_args.
+        request_id = request.request_id
+        waiting_started = self._continuum_evicted_waiting.pop(request_id, None)
         if waiting_started is not None:
             self._continuum_ttl_policy.observe_queue_delay(
                 max(0.0, self._continuum_clock() - waiting_started)
             )
-        self._continuum_request_arrival.pop(request.request_id, None)
-        if metadata.job_id is None:
+        self._continuum_request_arrival.pop(request_id, None)
+        job_id = self._continuum_request_jobs.get(request_id)
+        if job_id is None:
             return
-        self._continuum_evicted_jobs.discard(metadata.job_id)
-        pin = self._continuum_pins.handoff(metadata.job_id)
+        self._continuum_evicted_jobs.discard(job_id)
+        pin = self._continuum_pins.handoff(job_id)
         if pin is None:
             return
         self._release_continuum_pin(pin, "handoff")
 
     def _mark_continuum_evicted(self, job_id: str) -> None:
+        """Start the out-of-order queueing timer for a job that lost its KV.
+
+        The scan uses the unranked iterator; the ranked one would sort the
+        whole queue and call the ranker once per request on every eviction.
+        """
         self._continuum_evicted_jobs.add(job_id)
+        now = self._continuum_clock()
         for queue in (self.waiting, self.skipped_waiting):
-            for request in queue:
-                metadata = ContinuumRequestMetadata.from_request(request)
-                if metadata.job_id == job_id:
-                    waiting_started = self._continuum_request_arrival.get(
-                        request.request_id, self._continuum_clock()
-                    )
-                    self._continuum_evicted_waiting.setdefault(
-                        request.request_id, waiting_started
-                    )
+            for request in queue.unranked():
+                request_id = request.request_id
+                if self._continuum_request_jobs.get(request_id) != job_id:
+                    continue
+                waiting_started = self._continuum_request_arrival.get(request_id, now)
+                self._continuum_evicted_waiting.setdefault(request_id, waiting_started)
 
     def _forget_continuum_request(self, request_id: str) -> None:
         self._continuum_request_jobs.pop(request_id, None)

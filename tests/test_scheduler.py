@@ -501,6 +501,9 @@ def test_tier_availability_reaches_the_ttl_policy() -> None:
         def observe_reload(self, num_tokens: int, seconds: float) -> None:
             return None
 
+        def on_program_finished(self, job_id: str, completed: bool) -> None:
+            return None
+
     scheduler = ContinuumScheduler(
         continuum_clock=_Clock(0.0),
         connector=_Connector(),
@@ -512,3 +515,126 @@ def test_tier_availability_reaches_the_ttl_policy() -> None:
     scheduler._free_request(request)
 
     assert seen == [True]
+
+
+class _ProgramPolicy:
+    """Records the program lifecycle calls the scheduler makes."""
+
+    def __init__(self) -> None:
+        self.finished: list[tuple[str, bool]] = []
+        self.programs: list[int] = []
+        self.queue_delays: list[float] = []
+
+    def on_request_arrival(self, metadata: Any, now: float) -> None:
+        return None
+
+    def on_request_finished(
+        self,
+        metadata: Any,
+        output_text: Any,
+        now: float,
+        num_context_tokens: int = 0,
+        tier_available: bool = False,
+    ) -> Any:
+        return None
+
+    def observe_queue_delay(self, queue_delay: float) -> None:
+        self.queue_delays.append(queue_delay)
+
+    def observe_program(self, num_turns: int) -> None:
+        self.programs.append(num_turns)
+
+    def observe_reload(self, num_tokens: int, seconds: float) -> None:
+        return None
+
+    def on_program_finished(self, job_id: str, completed: bool) -> None:
+        self.finished.append((job_id, completed))
+
+
+def test_last_step_reports_a_completed_program() -> None:
+    policy = _ProgramPolicy()
+    scheduler = ContinuumScheduler(
+        continuum_clock=_Clock(10.0), continuum_environ={}, continuum_ttl_policy=policy
+    )
+    first = _request("first")
+    last = _request("last", is_last_step=1)
+
+    scheduler.add_request(first)
+    scheduler.add_request(last)
+    scheduler._free_request(last)
+
+    assert policy.finished == [("job", True)]
+    assert policy.programs == [2]
+
+
+def test_failed_turn_reports_an_abandoned_program() -> None:
+    policy = _ProgramPolicy()
+    scheduler = ContinuumScheduler(
+        continuum_clock=_Clock(10.0), continuum_environ={}, continuum_ttl_policy=policy
+    )
+    failed = _request("failed", status=_RequestStatus.FINISHED_ABORTED)
+
+    scheduler.add_request(failed)
+    scheduler._free_request(failed)
+
+    assert policy.finished == [("job", False)]
+    assert policy.programs == []
+
+
+def test_queue_delay_is_measured_from_eviction_to_readmission() -> None:
+    clock = _Clock(10.0)
+    policy = _ProgramPolicy()
+    scheduler = ContinuumScheduler(
+        continuum_clock=clock, continuum_environ={}, continuum_ttl_policy=policy
+    )
+    # A pin for this job is dropped, so the job is marked evicted.
+    scheduler._continuum_pins.pin("job", _request("old"), 12.0, 1.0, "pytest")
+    clock.now = 13.0
+    scheduler.schedule()
+    assert "job" in scheduler._continuum_evicted_jobs
+
+    # The next turn arrives and waits before being admitted.
+    clock.now = 20.0
+    nxt = _request("next")
+    scheduler.add_request(nxt)
+    clock.now = 23.5
+    scheduler._continuum_allocate_slots(nxt)
+
+    assert policy.queue_delays == [3.5]
+    # The sample is taken once, not on every later allocation.
+    clock.now = 30.0
+    scheduler._continuum_allocate_slots(nxt)
+    assert policy.queue_delays == [3.5]
+
+
+def test_eviction_marks_only_the_matching_job_already_waiting() -> None:
+    clock = _Clock(10.0)
+    policy = _ProgramPolicy()
+    scheduler = ContinuumScheduler(
+        continuum_clock=clock, continuum_environ={}, continuum_ttl_policy=policy
+    )
+    mine = _request("mine", job_id="mine")
+    other = _request("other", job_id="other")
+    scheduler.add_request(mine)
+    scheduler.add_request(other)
+
+    scheduler._mark_continuum_evicted("mine")
+
+    assert set(scheduler._continuum_evicted_waiting) == {"mine"}
+
+    clock.now = 14.0
+    scheduler._continuum_allocate_slots(mine)
+    scheduler._continuum_allocate_slots(other)
+    assert policy.queue_delays == [4.0]
+
+
+def test_unranked_scan_does_not_sort_the_waiting_queue() -> None:
+    scheduler = ContinuumScheduler(continuum_clock=_Clock(10.0), continuum_environ={})
+    late = _request("late", job_id="late", arrival_time=9.0)
+    early = _request("early", job_id="early", arrival_time=1.0)
+    scheduler.add_request(late)
+    scheduler.add_request(early)
+
+    # Ranked order is by program arrival; storage order is insertion order.
+    assert [r.request_id for r in scheduler.waiting] == ["early", "late"]
+    assert [r.request_id for r in scheduler.waiting.unranked()] == ["late", "early"]

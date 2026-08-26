@@ -45,6 +45,14 @@ class ContinuumRequestQueue(FCFSRequestQueue):
     def prepend_requests(self, requests: RequestQueue) -> None:
         self.extend(requests)
 
+    def unranked(self) -> Iterator[Request]:
+        """Iterate in storage order, skipping the ranking sort.
+
+        Bookkeeping scans do not care about scheduling order, and the ranked
+        iterator costs one ranker call per request plus a sort.
+        """
+        return deque.__iter__(self)
+
     def __iter__(self) -> Iterator[Request]:
         if self._ranker is None:
             return deque.__iter__(self)

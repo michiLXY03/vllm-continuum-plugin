@@ -12,6 +12,9 @@ from typing import Any, Literal, Protocol
 
 DEFAULT_TTL_SECONDS = 2.0
 DEFAULT_PREFILL_SECONDS = 2.0
+DEFAULT_PENDING_TOOL_MAX_ENTRIES = 4096
+DEFAULT_PENDING_TOOL_MAX_AGE_SECONDS = 3600.0
+MAX_TRACKED_PROGRAM_LENGTHS = 1024
 TTLSource = Literal["cold_start", "global", "tool"]
 ReconstructionSource = Literal["prefill", "reload", "prefill_fallback"]
 
@@ -216,6 +219,8 @@ class TTLPolicy(Protocol):
 
     def observe_reload(self, num_tokens: int, seconds: float) -> None: ...
 
+    def on_program_finished(self, job_id: str, completed: bool) -> None: ...
+
 
 class PrefillCostEstimator(Protocol):
     """Estimate the cost of recomputing a prefix from scratch, in seconds."""
@@ -376,6 +381,19 @@ class SlidingWindowMean:
             return self._initial_value
         return self._total / len(self._values)
 
+    @property
+    def sample_count(self) -> int:
+        return len(self._values)
+
+    @property
+    def window_size(self) -> int:
+        return self._window_size
+
+    @property
+    def is_warm(self) -> bool:
+        """False while `value` is still the cold-start default."""
+        return bool(self._values)
+
     def __len__(self) -> int:
         return len(self._values)
 
@@ -385,6 +403,8 @@ class MemoryfulnessEstimator:
 
     def __init__(self, initial_value: float = 1.0) -> None:
         self._initial_value = initial_value
+        self._program_count = 0
+        self._program_lengths: set[int] = set()
         self._count = 0
         self._sum_x = 0.0
         self._sum_y = 0.0
@@ -395,6 +415,9 @@ class MemoryfulnessEstimator:
     def observe_program(self, num_turns: int) -> None:
         if num_turns <= 0:
             return
+        self._program_count += 1
+        if len(self._program_lengths) < MAX_TRACKED_PROGRAM_LENGTHS:
+            self._program_lengths.add(num_turns)
         for completed_turns in range(1, num_turns + 1):
             self._observe(completed_turns, num_turns - completed_turns)
 
@@ -424,6 +447,90 @@ class MemoryfulnessEstimator:
     @property
     def sample_count(self) -> int:
         return self._count
+
+    @property
+    def program_count(self) -> int:
+        return self._program_count
+
+    @property
+    def distinct_length_count(self) -> int:
+        return len(self._program_lengths)
+
+    @property
+    def is_informative(self) -> bool:
+        """Whether eta carries any signal yet.
+
+        Within a single program k and N-k are perfectly anti-correlated, so
+        eta is exactly 1.0 until programs of at least two different lengths
+        have been observed. Reporting that distinction keeps a cold estimator
+        from being mistaken for a measured one.
+        """
+        return len(self._program_lengths) >= 2
+
+
+class PendingToolCalls:
+    """Track the in-flight tool call of each program, with bounds.
+
+    An agent program can stop sending turns at any time, so entries are
+    capped and aged out instead of being kept until the process exits. A
+    stale entry is dropped rather than recorded, because the gap it measures
+    is an abandoned session rather than a tool execution.
+    """
+
+    def __init__(
+        self,
+        max_entries: int = DEFAULT_PENDING_TOOL_MAX_ENTRIES,
+        max_age_seconds: float = DEFAULT_PENDING_TOOL_MAX_AGE_SECONDS,
+    ) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        if max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be positive")
+        self._entries: dict[str, tuple[float, str | None]] = {}
+        self._max_entries = max_entries
+        self._max_age_seconds = max_age_seconds
+        self.evicted = 0
+        self.expired = 0
+
+    def start(self, job_id: str, now: float, tool_name: str | None) -> None:
+        self.prune(now)
+        if job_id not in self._entries and len(self._entries) >= self._max_entries:
+            oldest = next(iter(self._entries))
+            del self._entries[oldest]
+            self.evicted += 1
+        self._entries[job_id] = (now, tool_name)
+
+    def finish(self, job_id: str, now: float) -> tuple[float, str | None] | None:
+        """Return (duration, tool_name) or None when there is nothing valid."""
+        entry = self._entries.pop(job_id, None)
+        if entry is None:
+            return None
+        started_at, tool_name = entry
+        duration = now - started_at
+        if duration > self._max_age_seconds:
+            self.expired += 1
+            return None
+        return max(0.0, duration), tool_name
+
+    def discard(self, job_id: str) -> None:
+        self._entries.pop(job_id, None)
+
+    def prune(self, now: float) -> None:
+        cutoff = now - self._max_age_seconds
+        stale = [
+            job_id
+            for job_id, (started_at, _) in self._entries.items()
+            if started_at < cutoff
+        ]
+        for job_id in stale:
+            del self._entries[job_id]
+            self.expired += 1
+
+    def __contains__(self, job_id: str) -> bool:
+        return job_id in self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 class ToolDurationHistory:
@@ -460,6 +567,12 @@ class ToolDurationHistory:
 
     @staticmethod
     def finish_probability(samples: Sequence[float], ttl_seconds: float) -> float:
+        """P(tau, f) from the paper: the share of samples with t <= tau.
+
+        `PaperTTLPolicy._maximize_utility` inlines this against a pre-sorted
+        list so the search stays O(n log n); `test_policy` asserts the two
+        agree so the duplicate cannot drift.
+        """
         if not samples:
             return 0.0
         ordered = sorted(samples)
@@ -476,6 +589,8 @@ class PaperTTLConfig:
     queue_delay_window_size: int = 100
     reload_max_samples: int = 1024
     reload_min_samples: int = 32
+    pending_tool_max_entries: int = DEFAULT_PENDING_TOOL_MAX_ENTRIES
+    pending_tool_max_age_seconds: float = DEFAULT_PENDING_TOOL_MAX_AGE_SECONDS
 
     def __post_init__(self) -> None:
         if self.history_threshold < 0:
@@ -490,6 +605,10 @@ class PaperTTLConfig:
             raise ValueError("reload_min_samples must be at least 2")
         if self.reload_max_samples < self.reload_min_samples:
             raise ValueError("reload_max_samples must be >= reload_min_samples")
+        if self.pending_tool_max_entries <= 0:
+            raise ValueError("pending_tool_max_entries must be positive")
+        if self.pending_tool_max_age_seconds <= 0:
+            raise ValueError("pending_tool_max_age_seconds must be positive")
 
 
 class BashToolCallParser:
@@ -527,20 +646,32 @@ class PaperTTLPolicy:
             self.config.queue_delay_window_size, initial_value=0.0
         )
         self.memoryfulness = MemoryfulnessEstimator(initial_value=1.0)
-        self._pending_tools: dict[str, tuple[float, str | None]] = {}
+        self.pending_tools = PendingToolCalls(
+            max_entries=self.config.pending_tool_max_entries,
+            max_age_seconds=self.config.pending_tool_max_age_seconds,
+        )
+        self.completed_programs = 0
+        self.abandoned_programs = 0
 
     def on_request_arrival(
         self, metadata: ContinuumRequestMetadata, now: float
     ) -> None:
+        """Close the tool-call timer opened when the previous turn finished.
+
+        The measured span is `next turn arrives - previous turn finished`, so
+        it covers tool execution plus whatever the agent framework does around
+        it. That is exactly the interval the TTL has to cover, which is why it
+        is the one recorded.
+        """
         if metadata.job_id is None:
             return
-        previous = self._pending_tools.pop(metadata.job_id, None)
-        if previous is None:
+        finished = self.pending_tools.finish(metadata.job_id, now)
+        if finished is None:
             return
-        finished_at, parsed_tool = previous
+        duration, parsed_tool = finished
         tool_name = metadata.last_func_call or parsed_tool
         if tool_name is not None:
-            self.tool_history.observe(tool_name, max(0.0, now - finished_at))
+            self.tool_history.observe(tool_name, duration)
 
     def on_request_finished(
         self,
@@ -557,10 +688,10 @@ class PaperTTLPolicy:
         if tool_name is None and output_text:
             tool_name = self.parser.parse(output_text)
         if metadata.is_last_step is True:
-            self._pending_tools.pop(metadata.job_id, None)
+            self.pending_tools.discard(metadata.job_id)
             return None
 
-        self._pending_tools[metadata.job_id] = (now, tool_name)
+        self.pending_tools.start(metadata.job_id, now, tool_name)
         if tool_name is None:
             return None
 
@@ -653,6 +784,33 @@ class PaperTTLPolicy:
     def observe_reload(self, num_tokens: int, seconds: float) -> None:
         self.reconstruction.observe_reload(num_tokens, seconds)
 
+    def on_program_finished(self, job_id: str, completed: bool) -> None:
+        """Release per-program state once a program can send no more turns.
+
+        `completed` is True only when the program ended with is_last_step,
+        the one case where the turn count N is known and eta can be updated.
+        Every other ending is counted separately so an operator can tell how
+        much of the workload never reaches the memoryfulness estimator.
+        """
+        self.pending_tools.discard(job_id)
+        if completed:
+            self.completed_programs += 1
+        else:
+            self.abandoned_programs += 1
+
+    @property
+    def ttl_stage(self) -> TTLSource:
+        """The most advanced of the paper's three cold-start stages in use."""
+        threshold = self.config.history_threshold
+        if self.tool_history.global_count <= threshold:
+            return "cold_start"
+        if any(
+            self.tool_history.tool_count(name) > threshold
+            for name in self.tool_history.tool_names()
+        ):
+            return "tool"
+        return "global"
+
 
 def prefill_estimator_from_profile(path: str) -> QuadraticPrefillCostEstimator:
     """Load the coefficients written by `continuum-vllm-profile`."""
@@ -725,6 +883,16 @@ def paper_ttl_policy_from_env(
         ),
         reload_max_samples=_env_int(values, "CONTINUUM_RELOAD_MAX_SAMPLES", 1024),
         reload_min_samples=_env_int(values, "CONTINUUM_RELOAD_MIN_SAMPLES", 32),
+        pending_tool_max_entries=_env_int(
+            values,
+            "CONTINUUM_PENDING_TOOL_MAX_ENTRIES",
+            DEFAULT_PENDING_TOOL_MAX_ENTRIES,
+        ),
+        pending_tool_max_age_seconds=_env_float(
+            values,
+            "CONTINUUM_PENDING_TOOL_MAX_AGE_SECONDS",
+            DEFAULT_PENDING_TOOL_MAX_AGE_SECONDS,
+        ),
     )
     reconstruction = ReconstructionCostModel(
         prefill=prefill_estimator_from_env(values),
